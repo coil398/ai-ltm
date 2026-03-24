@@ -4,7 +4,7 @@ description: "AI長期記憶システム。セッション開始時に関連記�
 
 # AI Long-Term Memory (ai-ltm)
 
-あなたには `~/ai-ltm/memory.db` (SQLite) を使った長期記憶がある。
+あなたには `~/ai-ltm-data/memory.db` (SQLite) を使った長期記憶がある。
 全プロジェクト横断で、過去の学び・失敗・意思決定・中断点を蓄積・活用する。
 
 スクリプトのベースパス: このSKILL.mdと同じディレクトリに `scripts/` がある。
@@ -16,14 +16,20 @@ description: "AI長期記憶システム。セッション開始時に関連記�
 会話の最初のターンで以下を実行する:
 
 ```bash
-cd ~/ai-ltm && git pull --rebase --quiet 2>/dev/null; echo "ltm-sync: ok"
+if [ -d ~/ai-ltm-data/.git ]; then
+  cd ~/ai-ltm-data && git pull --rebase --quiet 2>/dev/null; echo "ltm-sync: ok"
+else
+  echo "ltm-setup-needed"
+fi
 ```
+
+`ltm-setup-needed` が返った場合は `references/setup.md` を読んで初回セットアップを案内する。
 
 その後、現在のタスクに関連する記憶を**combined search**（FTS + ベクトル類似度の複合検索）で検索する:
 
 ```bash
 python3 ~/ai-ltm/scripts/vector_search.py combined \
-  --db ~/ai-ltm/memory.db \
+  --db ~/ai-ltm-data/memory.db \
   --query '<現在のタスクに関連するキーワード>' \
   --limit 5
 ```
@@ -34,7 +40,7 @@ FTS検索でエラーになる場合（クエリ構文の問題など）は、�
 
 ```bash
 python3 ~/ai-ltm/scripts/vector_search.py search \
-  --db ~/ai-ltm/memory.db \
+  --db ~/ai-ltm-data/memory.db \
   --query '<キーワード>' \
   --limit 5
 ```
@@ -53,7 +59,7 @@ python3 ~/ai-ltm/scripts/vector_search.py search \
 記録する際は、シングルクォートのエスケープに注意する。サマリやコンテキストに `'` が含まれる場合は `''` に置換する:
 
 ```bash
-sqlite3 ~/ai-ltm/memory.db <<'EOSQL'
+sqlite3 ~/ai-ltm-data/memory.db <<'EOSQL'
 INSERT INTO episodes (summary, context, tags)
 VALUES (
   '簡潔なサマリ（シングルクォートは''で二重化）',
@@ -66,9 +72,9 @@ EOSQL
 記録後、ベクトル埋め込みを生成する（last_insert_rowidで直前のINSERTのIDを取得）:
 
 ```bash
-EPISODE_ID=$(sqlite3 ~/ai-ltm/memory.db "SELECT last_insert_rowid();")
+EPISODE_ID=$(sqlite3 ~/ai-ltm-data/memory.db "SELECT last_insert_rowid();")
 python3 ~/ai-ltm/scripts/vector_search.py embed \
-  --db ~/ai-ltm/memory.db \
+  --db ~/ai-ltm-data/memory.db \
   --id "$EPISODE_ID"
 ```
 
@@ -92,9 +98,9 @@ python3 ~/ai-ltm/scripts/vector_search.py embed \
 3. 埋め込みをリビルドする（スキーマ変更でテキストカラムが増えた場合）
 
 ```bash
-sqlite3 ~/ai-ltm/memory.db "ALTER TABLE episodes ADD COLUMN <新カラム> <型>;"
+sqlite3 ~/ai-ltm-data/memory.db "ALTER TABLE episodes ADD COLUMN <新カラム> <型>;"
 
-sqlite3 ~/ai-ltm/memory.db <<'EOSQL'
+sqlite3 ~/ai-ltm-data/memory.db <<'EOSQL'
 INSERT INTO episodes (summary, context, tags)
 VALUES (
   'スキーマ変更: episodesに<新カラム>を追加',
@@ -119,17 +125,17 @@ combined searchスクリプトは以下のロジックで統合スコアを算�
 
 ```bash
 # ベクトル検索を重視する場合
-sqlite3 ~/ai-ltm/memory.db "UPDATE config SET value = '0.3' WHERE key = 'fts_weight';"
-sqlite3 ~/ai-ltm/memory.db "UPDATE config SET value = '0.7' WHERE key = 'vector_weight';"
+sqlite3 ~/ai-ltm-data/memory.db "UPDATE config SET value = '0.3' WHERE key = 'fts_weight';"
+sqlite3 ~/ai-ltm-data/memory.db "UPDATE config SET value = '0.7' WHERE key = 'vector_weight';"
 
 # 古い記憶もよく引くようにする場合（減衰を緩やかに）
-sqlite3 ~/ai-ltm/memory.db "UPDATE config SET value = '90' WHERE key = 'time_decay_days';"
+sqlite3 ~/ai-ltm-data/memory.db "UPDATE config SET value = '90' WHERE key = 'time_decay_days';"
 ```
 
 episodesが大量に増えた場合や検索精度が落ちたと感じた場合、埋め込みをリビルドする:
 
 ```bash
-python3 ~/ai-ltm/scripts/vector_search.py rebuild --db ~/ai-ltm/memory.db
+python3 ~/ai-ltm/scripts/vector_search.py rebuild --db ~/ai-ltm-data/memory.db
 ```
 
 ---
@@ -143,7 +149,7 @@ python3 ~/ai-ltm/scripts/vector_search.py rebuild --db ~/ai-ltm/memory.db
 3. git pushで同期する
 
 ```bash
-sqlite3 ~/ai-ltm/memory.db <<'EOSQL'
+sqlite3 ~/ai-ltm-data/memory.db <<'EOSQL'
 INSERT INTO episodes (summary, context, tags)
 VALUES (
   'セッション全体の簡潔なサマリ',
@@ -152,12 +158,12 @@ VALUES (
 );
 EOSQL
 
-EPISODE_ID=$(sqlite3 ~/ai-ltm/memory.db "SELECT last_insert_rowid();")
+EPISODE_ID=$(sqlite3 ~/ai-ltm-data/memory.db "SELECT last_insert_rowid();")
 python3 ~/ai-ltm/scripts/vector_search.py embed \
-  --db ~/ai-ltm/memory.db \
+  --db ~/ai-ltm-data/memory.db \
   --id "$EPISODE_ID"
 
-cd ~/ai-ltm && git add memory.db && git commit -m "session: $(date +%Y-%m-%d) 簡潔な説明" && git push
+cd ~/ai-ltm-data && git add memory.db && git commit -m "session: $(date +%Y-%m-%d) 簡潔な説明" && git push
 ```
 
 `git add` は `memory.db` のみを対象にする。`-A` は使わない（一時ファイルの混入を防ぐため）。
@@ -171,7 +177,7 @@ cd ~/ai-ltm && git add memory.db && git commit -m "session: $(date +%Y-%m-%d) �
 ポリシー: **両方のデータを保持する**。ローカルのepisodesをエクスポートし、リモート版をチェックアウトしてからローカル分をインポートする。
 
 ```bash
-cd ~/ai-ltm
+cd ~/ai-ltm-data
 
 # 1. ローカルのepisodesをダンプ
 sqlite3 memory.db "SELECT summary, context, tags, embedding, created_at FROM episodes;" > /tmp/ltm_local_dump.txt
@@ -187,7 +193,7 @@ sqlite3 memory.db <<'EOSQL'
 EOSQL
 
 # 4. 埋め込みをリビルドしてコミット
-python3 ~/ai-ltm/scripts/vector_search.py rebuild --db ~/ai-ltm/memory.db
+python3 ~/ai-ltm/scripts/vector_search.py rebuild --db ~/ai-ltm-data/memory.db
 git add memory.db
 git commit -m "merge: resolve binary conflict, merged episodes"
 git push

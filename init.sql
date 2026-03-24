@@ -1,5 +1,5 @@
 -- ai-ltm: SQLite schema for AI long-term memory
--- Run: sqlite3 ~/ai-ltm/memory.db < init.sql
+-- Run: sqlite3 ~/ai-ltm-data/memory.db < init.sql
 
 CREATE TABLE IF NOT EXISTS episodes (
   id         INTEGER PRIMARY KEY,
