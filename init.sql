@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS episodes (
   summary    TEXT NOT NULL,
   context    TEXT,
   tags       TEXT,
+  embedding  TEXT,  -- JSON array of floats (TF-IDF vector)
   created_at DATETIME DEFAULT (datetime('now'))
 );
 
