@@ -4,13 +4,28 @@ ai-ltm vector search: TF-IDF + cosine similarity (Python stdlib only).
 
 Usage:
   # Search episodes by vector similarity
-  python3 vector_search.py search --db ~/ai-ltm/memory.db --query "some query" --limit 5
+  python3 vector_search.py search --db ~/ai-ltm-data/memory.db --query "some query" --limit 5
+
+  # Search with tag/date filters
+  python3 vector_search.py search --db ~/ai-ltm-data/memory.db --query "query" --tags "learning typescript" --since 2025-01-01
 
   # Rebuild embeddings for all episodes (run after bulk import or schema migration)
-  python3 vector_search.py rebuild --db ~/ai-ltm/memory.db
+  python3 vector_search.py rebuild --db ~/ai-ltm-data/memory.db
 
   # Combined search: FTS + vector, weighted by config table values
-  python3 vector_search.py combined --db ~/ai-ltm/memory.db --query "some query" --limit 10
+  python3 vector_search.py combined --db ~/ai-ltm-data/memory.db --query "some query" --limit 10
+
+  # Embed a single episode
+  python3 vector_search.py embed --db ~/ai-ltm-data/memory.db --id 42
+
+  # Mark episodes as used (increment used_count, update last_used_at)
+  python3 vector_search.py mark-used --db ~/ai-ltm-data/memory.db --ids 1,2,3
+
+  # Archive old unused episodes
+  python3 vector_search.py archive --db ~/ai-ltm-data/memory.db
+
+  # Unarchive episodes by ID
+  python3 vector_search.py unarchive --db ~/ai-ltm-data/memory.db --ids 1,2,3
 """
 
 import argparse
@@ -97,6 +112,46 @@ def episode_text(row: sqlite3.Row) -> str:
     return " ".join(parts)
 
 
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Add missing columns and config defaults for self-improvement features.
+
+    This function is idempotent and safe to run on every invocation. It ensures
+    existing memory.db files (created before the self-improvement columns were
+    added) get migrated automatically without requiring manual ALTER TABLE.
+    """
+    # Ensure config table exists (older DBs may lack it if created without init.sql)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)"
+    )
+
+    # Check existing columns on episodes
+    cur = conn.execute("PRAGMA table_info(episodes)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+
+    migrations = [
+        ("used_count", "ALTER TABLE episodes ADD COLUMN used_count INTEGER DEFAULT 0"),
+        ("last_used_at", "ALTER TABLE episodes ADD COLUMN last_used_at DATETIME"),
+        ("archived", "ALTER TABLE episodes ADD COLUMN archived INTEGER DEFAULT 0"),
+    ]
+    for col, ddl in migrations:
+        if col not in existing_cols:
+            conn.execute(ddl)
+
+    # Ensure new config defaults exist
+    defaults = [
+        ("usage_boost_weight", "0.3"),
+        ("archive_after_days", "180"),
+        ("usage_recency_days", "30"),
+    ]
+    for key, value in defaults:
+        conn.execute(
+            "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+
+    conn.commit()
+
+
 def get_config(conn: sqlite3.Connection) -> dict[str, float]:
     """Read config values as floats (skip internal keys starting with '_')."""
     cur = conn.execute("SELECT key, value FROM config WHERE key NOT LIKE '\\_%' ESCAPE '\\'")
@@ -163,16 +218,49 @@ def embed_single(conn: sqlite3.Connection, episode_id: int) -> None:
     conn.commit()
 
 
+def build_filter_clause(
+    tags: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    include_archived: bool = False,
+) -> tuple[str, list]:
+    """Build WHERE clause fragments and params for tag/date filtering."""
+    clauses = []
+    params: list = []
+    if not include_archived:
+        clauses.append("archived = 0")
+    if tags:
+        for tag in tags.split():
+            clauses.append("tags LIKE ?")
+            params.append(f"%{tag}%")
+    if since:
+        clauses.append("created_at >= ?")
+        params.append(since)
+    if until:
+        clauses.append("created_at <= ?")
+        params.append(until)
+    where = " AND ".join(clauses)
+    return (f" WHERE {where}" if where else ""), params
+
+
 def search_vector(
-    conn: sqlite3.Connection, query: str, limit: int = 10
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 10,
+    tags: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    include_archived: bool = False,
 ) -> list[dict]:
-    """Search episodes by vector similarity."""
+    """Search episodes by vector similarity with optional tag/date filters."""
     idf = get_idf(conn)
     query_tokens = tokenize(query)
     query_vec = tfidf_vector(query_tokens, idf)
 
+    where, params = build_filter_clause(tags, since, until, include_archived=include_archived)
     rows = conn.execute(
-        "SELECT id, summary, context, tags, embedding, created_at FROM episodes"
+        f"SELECT id, summary, context, tags, embedding, created_at, used_count FROM episodes{where}",
+        params,
     ).fetchall()
 
     results = []
@@ -186,6 +274,7 @@ def search_vector(
                     "summary": row["summary"],
                     "tags": row["tags"],
                     "created_at": row["created_at"],
+                    "used_count": row["used_count"],
                     "vector_score": round(sim, 4),
                 }
             )
@@ -195,13 +284,21 @@ def search_vector(
 
 
 def search_combined(
-    conn: sqlite3.Connection, query: str, limit: int = 10
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 10,
+    tags: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    include_archived: bool = False,
 ) -> list[dict]:
-    """Combined FTS + vector search with configurable weights and time decay."""
+    """Combined FTS + vector search with configurable weights, time decay, and usage boost."""
     cfg = get_config(conn)
     fts_weight = cfg.get("fts_weight", 0.5)
     vec_weight = cfg.get("vector_weight", 0.5)
     decay_days = cfg.get("time_decay_days", 30)
+    usage_boost_weight = cfg.get("usage_boost_weight", 0.3)
+    usage_recency_days = cfg.get("usage_recency_days", 30)
 
     # FTS results — join tokens with OR for broader matching
     fts_query = " OR ".join(tokenize(query)) if tokenize(query) else query
@@ -221,13 +318,15 @@ def search_combined(
     except sqlite3.OperationalError:
         pass  # FTS match syntax may fail; fall back to vector only
 
-    # Vector results
+    # Vector results (with optional filters, excluding archived)
     idf = get_idf(conn)
     query_tokens = tokenize(query)
     query_vec = tfidf_vector(query_tokens, idf)
 
+    where, params = build_filter_clause(tags, since, until, include_archived=include_archived)
     rows = conn.execute(
-        "SELECT id, summary, context, tags, embedding, created_at FROM episodes"
+        f"SELECT id, summary, context, tags, embedding, created_at, used_count, last_used_at FROM episodes{where}",
+        params,
     ).fetchall()
 
     vec_scores: dict[int, float] = {}
@@ -241,6 +340,8 @@ def search_combined(
             "summary": row["summary"],
             "tags": row["tags"],
             "created_at": row["created_at"],
+            "used_count": row["used_count"],
+            "last_used_at": row["last_used_at"],
         }
 
     # Normalize vector scores
@@ -248,7 +349,7 @@ def search_combined(
     if max_vec > 0:
         vec_scores = {k: v / max_vec for k, v in vec_scores.items()}
 
-    # Combine scores with time decay
+    # Combine scores with time decay and usage boost
     all_ids = set(fts_scores) | set(vec_scores)
     results = []
     for eid in all_ids:
@@ -272,6 +373,24 @@ def search_combined(
             except (sqlite3.OperationalError, TypeError):
                 pass
 
+        # Usage boost: log(1 + used_count) scaled by weight and recency factor
+        used_count = data.get("used_count", 0) or 0
+        usage_boost = math.log(1 + used_count)
+        # recency_factor: 1.0 when never used (last_used_at is None), decays with age
+        last_used = data.get("last_used_at")
+        if last_used:
+            try:
+                days_since_use = conn.execute(
+                    "SELECT julianday('now') - julianday(?)",
+                    (last_used,),
+                ).fetchone()[0]
+                recency_factor = 1.0 / (1.0 + days_since_use / usage_recency_days)
+            except (sqlite3.OperationalError, TypeError):
+                recency_factor = 1.0
+        else:
+            recency_factor = 1.0
+        combined *= 1.0 + usage_boost_weight * usage_boost * recency_factor
+
         if combined > 0:
             results.append(
                 {
@@ -286,13 +405,83 @@ def search_combined(
     return results[:limit]
 
 
+def mark_used(conn: sqlite3.Connection, episode_ids: list[int]) -> int:
+    """Increment used_count and update last_used_at for given episode IDs."""
+    updated = 0
+    for eid in episode_ids:
+        cur = conn.execute(
+            """UPDATE episodes
+               SET used_count = used_count + 1,
+                   last_used_at = datetime('now')
+               WHERE id = ?""",
+            (eid,),
+        )
+        updated += cur.rowcount
+    conn.commit()
+    return updated
+
+
+def archive_episodes(conn: sqlite3.Connection, dry_run: bool = False) -> tuple[int, list[int]]:
+    """Archive episodes that are old, never used, and not used recently.
+
+    Returns (count, sample_ids) where sample_ids is up to 10 IDs of affected episodes.
+    When dry_run=True, no UPDATE is performed and the caller can preview the impact.
+    """
+    cfg = get_config(conn)
+    archive_after_days = int(cfg.get("archive_after_days", 180))
+
+    where_sql = """
+        FROM episodes
+        WHERE archived = 0
+          AND used_count = 0
+          AND julianday('now') - julianday(created_at) > ?
+          AND (last_used_at IS NULL OR julianday('now') - julianday(last_used_at) > ?)
+    """
+    params = (archive_after_days, archive_after_days)
+
+    # Find target IDs first (used for both dry-run preview and the actual UPDATE targets)
+    target_ids = [
+        row[0] for row in conn.execute(f"SELECT id {where_sql}", params).fetchall()
+    ]
+    count = len(target_ids)
+    sample_ids = target_ids[:10]
+
+    if not dry_run and count > 0:
+        conn.execute(f"UPDATE episodes SET archived = 1 WHERE id IN ({','.join('?' * count)})", target_ids)
+        conn.commit()
+
+    return count, sample_ids
+
+
+def unarchive_episodes(conn: sqlite3.Connection, episode_ids: list[int]) -> int:
+    """Unarchive episodes by ID."""
+    updated = 0
+    for eid in episode_ids:
+        cur = conn.execute(
+            "UPDATE episodes SET archived = 0 WHERE id = ? AND archived = 1",
+            (eid,),
+        )
+        updated += cur.rowcount
+    conn.commit()
+    return updated
+
+
 def main():
     parser = argparse.ArgumentParser(description="ai-ltm vector search")
-    parser.add_argument("command", choices=["search", "rebuild", "combined", "embed"])
+    parser.add_argument(
+        "command",
+        choices=["search", "rebuild", "combined", "embed", "mark-used", "archive", "unarchive"],
+    )
     parser.add_argument("--db", required=True, help="Path to memory.db")
     parser.add_argument("--query", help="Search query")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--id", type=int, help="Episode ID (for embed command)")
+    parser.add_argument("--ids", help="Comma-separated episode IDs (for mark-used/unarchive)")
+    parser.add_argument("--tags", help="Filter by tags (space-separated, AND logic)")
+    parser.add_argument("--since", help="Filter: created_at >= date (YYYY-MM-DD)")
+    parser.add_argument("--until", help="Filter: created_at <= date (YYYY-MM-DD)")
+    parser.add_argument("--include-archived", action="store_true", help="Include archived episodes in search")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run for archive command")
     args = parser.parse_args()
 
     db_path = Path(args.db).expanduser()
@@ -302,6 +491,7 @@ def main():
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
 
     if args.command == "rebuild":
         count = rebuild_embeddings(conn)
@@ -318,15 +508,46 @@ def main():
         if not args.query:
             print("Error: --query required", file=sys.stderr)
             sys.exit(1)
-        results = search_vector(conn, args.query, args.limit)
+        results = search_vector(
+            conn, args.query, args.limit,
+            tags=args.tags, since=args.since, until=args.until,
+            include_archived=args.include_archived,
+        )
         print(json.dumps(results, ensure_ascii=False, indent=2))
 
     elif args.command == "combined":
         if not args.query:
             print("Error: --query required", file=sys.stderr)
             sys.exit(1)
-        results = search_combined(conn, args.query, args.limit)
+        results = search_combined(
+            conn, args.query, args.limit,
+            tags=args.tags, since=args.since, until=args.until,
+            include_archived=args.include_archived,
+        )
         print(json.dumps(results, ensure_ascii=False, indent=2))
+
+    elif args.command == "mark-used":
+        if not args.ids:
+            print("Error: --ids required for mark-used command", file=sys.stderr)
+            sys.exit(1)
+        episode_ids = [int(x.strip()) for x in args.ids.split(",")]
+        count = mark_used(conn, episode_ids)
+        print(f"Marked {count} episodes as used.")
+
+    elif args.command == "archive":
+        count, sample_ids = archive_episodes(conn, dry_run=args.dry_run)
+        if args.dry_run:
+            print(f"[dry-run] Would archive {count} episodes. Sample IDs: {sample_ids}")
+        else:
+            print(f"Archived {count} episodes.")
+
+    elif args.command == "unarchive":
+        if not args.ids:
+            print("Error: --ids required for unarchive command", file=sys.stderr)
+            sys.exit(1)
+        episode_ids = [int(x.strip()) for x in args.ids.split(",")]
+        count = unarchive_episodes(conn, episode_ids)
+        print(f"Unarchived {count} episodes.")
 
     conn.close()
 
