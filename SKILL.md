@@ -1,10 +1,9 @@
 ---
 name: "ai-ltm"
 description: >-
-  AI長期記憶システム。セッション開始・再開・「前回の続き」・横断の学び参照で自動発動する。
-  セッション中の学び・失敗・意思決定・中断点も、ユーザーが言わなくても記録条件に該当したら書く。
-  明示トリガー: 「前回何やったっけ」「過去の学びを活かして」「前回の続きから」「失敗を記録して」
-  「セッション終了」「ltm」「長期記憶」。短期の方針キャッシュは /field-notes、日記は /ai-diary。
+  AI長期記憶システム。セッション開始・再開、前回の続き・過去の失敗・類似問題の横断参照では自動recallする。学び・失敗・意思決定・中断点が確定するなど記録条件に該当したとき、またはセッション終了・おやすみ・長く離れる旨が示されたときは、ユーザーに毎回尋ねず自動recordする。
+  自然言語トリガー例: 「前回何やったっけ」／「過去の学びを活かして」／「前回の続きから」／「長期記憶を参照して」／「失敗や意思決定を記録して」。
+  該当する文脈ではスキル名がなくても使う。毎回のツール成功や単なる進捗ログでは自動発動しない。短期の方針キャッシュは /field-notes、感想・日記は /ai-diary に委ね、二重書きしない。ユーザーが /ai-ltm と入力したら必ず使う。
 ---
 
 # AI Long-Term Memory (ai-ltm)
@@ -16,7 +15,7 @@ description: >-
 
 | いつ | やること |
 |---|---|
-| 会話の最初のターン / 長い中断からの再開 | pull + combined search（下「セッション開始時」）。結果は必要なものだけ作業に反映 |
+| 会話の最初のターン / 長い中断からの再開 | 補助的な recall worker に deterministic `session_recall.py` を非同期委譲（下「セッション開始時」）。main は完了を待たず本命へ進む |
 | 作業が「前回の続き」「過去の失敗を避けたい」「似た問題をまた踏んだ」 | 追加 search（limit 3〜5） |
 | 学び・失敗・意思決定・中断点が確定した | episodes に記録 + embed（下「セッション中の記録」）。毎回聞かない |
 | ユーザーがセッション終了・おやすみ・長く離れると言った | サマリ保存 + git 同期（スキル後半の終了手順） |
@@ -25,58 +24,44 @@ description: >-
 
 field-notes との分担: **今のキャンペーンで次の判断を変える事項** → field-notes。**後から横断検索したい経緯** → ai-ltm。両方に同じ文を二重書きしない（どちらか一方。必要なら field-notes promote 後に LTM へ要約1行）。
 
-スクリプトのベースパス: このSKILL.mdと同じディレクトリに `scripts/` がある。
-セッション開始時にまず SKILL_DIR を特定し、以降のコマンドで使用する:
-
-```bash
-SKILL_DIR="$(dirname "$(readlink -f ~/.agents/skills/ai-ltm/SKILL.md 2>/dev/null || echo ~/.agents/skills/ai-ltm/SKILL.md)")"
-```
-
-以下のコマンド例はすべて `$SKILL_DIR` がセットされていることを前提とする。
+スクリプトのベースパス: 親は今回ロードしたこの `SKILL.md` の実体パスを解決し、その親ディレクトリを `SKILL_DIR` とする。`SKILL_DIR/scripts/session_recall.py` は親が構成する絶対パスを使い、以下のコマンド例はすべて `$SKILL_DIR` がセットされていることを前提とする。
 
 ---
 
 ## セッション開始時
 
-会話の最初のターンで以下を実行する:
+セッション開始時の recall は本命タスクを補助する作業であり、本命タスクを block してはならない。会話の最初のターンまたは長い中断からの再開で、本命タスクを開始する直前に専任 recall subagent を 1 体だけ起動する。main は起動後に worker を await、blocking read、wait、完了待ちの follow-up をせず、直ちに本命タスクへ進む。recall の起動失敗、未実行、遅延、pull/search/schema/timeout の失敗はいずれも本命を block しない。
 
-```bash
-if [ -d ~/ai-ltm-data/.git ]; then
-  cd ~/ai-ltm-data && git pull --rebase --quiet 2>/dev/null; echo "ltm-sync: ok"
-else
-  echo "ltm-setup-needed"
-fi
+親は、ロードしたこの `SKILL.md` の実体パスを絶対化してその親ディレクトリを `SKILL_DIR` とし、`SKILL_DIR/scripts/session_recall.py` を `SESSION_RECALL_SCRIPT` の絶対パスとして確定する。親は現在のユーザータスクから具体的な plain-text の `CURRENT_TASK_QUERY` と `CURRENT_TASK_SUMMARY` を作り、shell interpolation ではなく runtime の UTF-8 standard base64 primitive でそれぞれをエンコードする。worker message には親が確定した絶対パスと `CURRENT_TASK_QUERY_B64` / `CURRENT_TASK_SUMMARY_B64` だけを埋め込み、raw query / summary を埋め込まない。
+
+shared core は特定 runtime の API 名を仮定せず、runtime が提供する native one-shot / no-fork async subagent API に worker message を渡す。message には次の引数を持つ `session_recall.py` の起動を 1 回だけ含める:
+
+```text
+python3 "<絶対パス SESSION_RECALL_SCRIPT>" \
+  --repo ~/ai-ltm-data --db ~/ai-ltm-data/memory.db \
+  --query-b64 "<CURRENT_TASK_QUERY_B64>" \
+  --summary-b64 "<CURRENT_TASK_SUMMARY_B64>" --limit 5
 ```
 
-`ltm-setup-needed` が返った場合は `references/setup.md` を読んで初回セットアップを案内する。
+### Claude Code での recall worker 起動
 
-その後、現在のタスクに関連する記憶を**combined search**（FTS + ベクトル類似度の複合検索）で検索する:
+Claude Code では、上記の worker message を `general-purpose` Agent に渡して起動する:
 
-```bash
-python3 "$SKILL_DIR/scripts/vector_search.py" combined \
-  --db ~/ai-ltm-data/memory.db \
-  --query '<現在のタスクに関連するキーワード>' \
-  --limit 5
+```text
+Agent({
+  subagent_type: "general-purpose",
+  run_in_background: true,
+  prompt: "python3 '<絶対パス SESSION_RECALL_SCRIPT>' --repo ~/ai-ltm-data --db ~/ai-ltm-data/memory.db --query-b64 '<CURRENT_TASK_QUERY_B64>' --summary-b64 '<CURRENT_TASK_SUMMARY_B64>' --limit 5 を1回だけ実行し、JSONLのstage eventとterminal recordだけを返す"
+})
 ```
 
-検索キーワードは現在の作業内容から判断する。関連する記憶があれば活用し、なければそのまま作業を進める。
+`prompt` には親が確定した `SESSION_RECALL_SCRIPT` の絶対パスと `CURRENT_TASK_QUERY_B64` / `CURRENT_TASK_SUMMARY_B64` だけを埋め込み、raw query / summary は含めない。メイン Claude は Agent の完了を await、blocking read、wait、完了待ちの follow-up で待たず、起動直後に本命タスクへ進む。
 
-検索結果の記憶を実際に活用した場合（参照して作業に反映した場合）、使用した記憶の used_count をインクリメントする:
+worker は親から受け取った絶対 script path と encoded 値をそのまま使い、`session_recall.py` をちょうど 1 回だけ実行する。worker が main へ返すのはスクリプトが出力した JSONL の stage event と最後の terminal record だけであり、個別の git / vector search command や別の fallback search を重ねない。親は worker の結果を待たず本命へ進む。
 
-```bash
-python3 "$SKILL_DIR/scripts/vector_search.py" mark-used \
-  --db ~/ai-ltm-data/memory.db \
-  --ids '<活用したepisodeのIDをカンマ区切りで>'
-```
+処理順は **preflight → optional pull → read-only combined search → report**。preflight で repository が無ければ `setup-needed`、dirty なら pull を skip して search を続ける。DB が無い場合や schema / IDF が不足する場合は search stage の明示的な failure とする。pull は非対話・bounded・最大 1 回の分類済み transient retry、search は既存 DB を read-only で開く。許可する terminal status は `completed` / `dirty` / `setup-needed` / `pull-failed` / `search-failed` / `timed-out` / `failed` のみとし、preflight failure は `failed` に stage detail を付けて報告する。stage の失敗詳細には固定カテゴリと終了コードなどのプロセスメタデータだけを残し、child stdout/stderr は含めない。
 
-FTS検索でエラーになる場合（クエリ構文の問題など）は、ベクトル検索にフォールバックする:
-
-```bash
-python3 "$SKILL_DIR/scripts/vector_search.py" search \
-  --db ~/ai-ltm-data/memory.db \
-  --query '<キーワード>' \
-  --limit 5
-```
+script は preflight / pull / search の間、repository 外の advisory lock を保持する。これは協調する ai-ltm writer に対する advisory protection であり、協調しない外部 writer までは保護しない。recall の terminal record を観測するまで、episodes の insert、embed、`mark-used`、archive、git 同期などの ai-ltm write は defer または skip する。検索結果を実際に本命タスクへ反映した場合だけ、`mark-used` は recall とは別の非同期処理として扱い、その完了を待たない。main は recall の待ち時間を作業停止には使わず、本命タスクを継続する。lock の取得も小さな bounded deadline で打ち切り、busy は `timed-out` として報告する。native subagent API を利用できない場合も recall を省略して本命を継続する。
 
 ---
 
@@ -190,7 +175,7 @@ python3 "$SKILL_DIR/scripts/vector_search.py" rebuild --db ~/ai-ltm-data/memory.
 
 1. 会話全体のサマリをepisodesに記録する
 2. 埋め込みを生成する
-3. git pushで同期する
+3. `sync_memory.py push` で `memory.db` だけを同期する
 
 ```bash
 EPISODE_ID=$(sqlite3 ~/ai-ltm-data/memory.db <<'EOSQL'
@@ -212,47 +197,28 @@ python3 "$SKILL_DIR/scripts/vector_search.py" embed \
 python3 "$SKILL_DIR/scripts/vector_search.py" archive \
   --db ~/ai-ltm-data/memory.db
 
-cd ~/ai-ltm-data && git add memory.db && git commit -m "session: $(date +%Y-%m-%d) 簡潔な説明" && git push
+python3 "$SKILL_DIR/scripts/sync_memory.py" push \
+  --repo ~/ai-ltm-data \
+  --db ~/ai-ltm-data/memory.db \
+  --message "session: $(date +%Y-%m-%d) 簡潔な説明"
 ```
 
-`git add` は `memory.db` のみを対象にする。`-A` は使わない（一時ファイルの混入を防ぐため）。
+`push` は同期直前にもリモート変更を取り込み、自動マージ後の `memory.db` だけをコミット・pushする。失敗した場合は成功扱いにせず、そこで停止して表示された原因をユーザーに報告する。
 
 ---
 
-## コンフリクト対処
+## 安全な同期と競合復旧
 
-`git pull` でコンフリクトが発生した場合（SQLiteはバイナリなので通常のマージはできない）。
+`sync_memory.py` は Git の通常マージに SQLite バイナリを任せず、共通祖先・ローカル・リモートの3つの DB を使って `episodes`、`meta`、`config` を3-way mergeする。双方で追加・変更された記憶を保持し、検索インデックスの整合性も検証してから DB を原子的に置換する。
 
-予防: 必ず pull → 作業 → push の順で操作する。セッション開始時の `git pull --rebase` を省略しない。
+同期前に次の状態を検出した場合は、安全のため Git や DB を変更せず停止する:
 
-ポリシー: 両方のデータを保持する。ローカルの episodes を JSON にダンプし、リモート版をチェックアウトしてからローカル分をインポートする。
+- `memory.db` 以外の未コミット変更がある
+- `memory.db` が未ステージ変更以外の状態になっている
+- merge、rebase、cherry-pick など既存の Git 操作が進行中
+- detached HEAD、upstream 未設定、別の LTM 同期処理が実行中
 
-```bash
-cd ~/ai-ltm-data
-
-# 1. ローカルの episodes を JSON にダンプ
-python3 "$SKILL_DIR/scripts/merge_conflict.py" dump \
-  --db ~/ai-ltm-data/memory.db \
-  --out /tmp/ltm_local.json
-
-# 2. リモート版を採用
-git checkout --theirs memory.db
-git add memory.db
-
-# 3. ローカルの episodes をインポート（重複は summary + created_at で判定しスキップ）
-python3 "$SKILL_DIR/scripts/merge_conflict.py" import \
-  --db ~/ai-ltm-data/memory.db \
-  --input /tmp/ltm_local.json
-
-# 4. 埋め込みをリビルドしてコミット
-python3 "$SKILL_DIR/scripts/vector_search.py" rebuild --db ~/ai-ltm-data/memory.db
-git add memory.db
-git commit -m "merge: resolve binary conflict, merged episodes"
-git push
-
-# 5. 一時ファイルを削除
-rm -f /tmp/ltm_local.json
-```
+`pull` の fetch、マージ、DB検証、またはマージ統合commitが失敗した場合は、作業前の SQLite スナップショットと開始時のGit HEADへ復元して非ゼロで終了する。`push` の同期前処理も同じ復元境界を持つが、同期後の専用commitまたはpushが失敗した場合は成功扱いにせず、作成済みのローカルcommitとDBを保持して原因を報告する。手動で片方の DB を選ぶ操作や競合中の commit は行わず、原因を解消してから同じ `pull` または `push` コマンドを改めて実行する。
 
 ---
 
@@ -339,22 +305,11 @@ python3 "$SKILL_DIR/scripts/vector_search.py" unarchive \
 sqlite3 ~/ai-ltm-data/memory.db "SELECT id, created_at, substr(summary, 1, 60), tags FROM episodes WHERE archived = 1 ORDER BY created_at DESC;"
 ```
 
-### スキーマの自動マイグレーション
+### スキーマと検索前提
 
-`vector_search.py` は起動時に自動的に `used_count` / `last_used_at` / `archived` カラムと関連 config の有無をチェックし、欠けているものを追加する。そのため既存 DB でも手動マイグレーションは原則不要。内部では `ALTER TABLE episodes ADD COLUMN` を実行しているだけなので、既存データは保持される。
+`init.sql` が現行スキーマのSSOTである。`search` / `combined` は既存DBをread-onlyで開き、検索中に `CREATE` / `ALTER` / IDF再構築を行わない。必要なテーブル、カラム、FTS、cached IDF、設定値が不足または不正な場合は、具体的な schema/config エラーを非ゼロで報告して停止する。
 
-手動で行う場合の SQL:
-
-```bash
-sqlite3 ~/ai-ltm-data/memory.db <<'EOSQL'
-ALTER TABLE episodes ADD COLUMN used_count INTEGER DEFAULT 0;
-ALTER TABLE episodes ADD COLUMN last_used_at DATETIME;
-ALTER TABLE episodes ADD COLUMN archived INTEGER DEFAULT 0;
-INSERT OR IGNORE INTO config VALUES ('usage_boost_weight', '0.3');
-INSERT OR IGNORE INTO config VALUES ('usage_recency_days', '30');
-INSERT OR IGNORE INTO config VALUES ('archive_after_days', '180');
-EOSQL
-```
+新規DBは初回セットアップ時に `init.sql` を適用し、既存DBの更新は書き込みを伴う明示的なメンテナンス手順として実施する。検索経路が不足スキーマを自動補完することや、手動更新が不要であることを前提にしない。
 
 ---
 

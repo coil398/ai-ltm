@@ -1,6 +1,6 @@
 # AI Long-Term Memory (ai-ltm)
 
-AIアシスタント（Claude）にセッションを跨いだ長期記憶を提供するシステム。
+AIアシスタントにセッションを跨いだ長期記憶を提供するシステム。
 プロジェクト横断で過去の学び・失敗・意思決定・中断点を SQLite に蓄積し、ハイブリッド検索（FTS + ベクトル類似度）で関連記憶を呼び出す。
 使用頻度フィードバックと自動アーカイブにより、時間とともに検索品質が改善される自己改善型の設計。
 
@@ -10,19 +10,21 @@ AIアシスタント（Claude）にセッションを跨いだ長期記憶を提
 - ハイブリッド検索: SQLite FTS5 の全文検索と TF-IDF ベクトル類似度検索の組み合わせ
 - 自己改善: 使われた記憶をスコアブーストし、使われない記憶は自動アーカイブ
 - 外部依存なし: Python 標準ライブラリと SQLite のみで動作
-- Git 同期: プライベート GitHub リポジトリでデータをバックアップ・同期
+- Git 同期: SQLite 3-way merge付きの安全なCLIでプライベート GitHub リポジトリへバックアップ・同期
 - CJK 対応: 日本語・中国語・韓国語テキストのバイグラムトークナイズに対応
-- 自動マイグレーション: スクリプト起動時にスキーマを自動更新し、既存 DB の互換性を維持
+- 明示的なスキーマ管理: `init.sql` をSSOTとし、read-only検索では不足スキーマを自動更新しない
 
 ## 構成
 
 ```
 ai-ltm/
-├── SKILL.md                    # Claude Code スキル定義
+├── SKILL.md                    # runtime 共通スキル定義
 ├── init.sql                    # SQLite スキーマ初期化
 ├── scripts/
 │   ├── vector_search.py        # 検索エンジン（TF-IDF + コサイン類似度）
-│   └── merge_conflict.py       # git コンフリクト時のエピソードマージ
+│   ├── session_recall.py       # セッション開始時の非同期recall
+│   ├── merge_conflict.py       # SQLite DBの3-way mergeエンジン
+│   └── sync_memory.py          # pull/pushと競合復旧を安全に行う同期CLI
 └── references/
     └── setup.md                # 初回セットアップガイド
 ```
@@ -37,10 +39,10 @@ ai-ltm/
 
 ## セットアップ
 
-スキルは `~/.claude/skills/ai-ltm/` にインストールされる想定。以下では `SKILL_DIR` 変数にスキルの実パスをセットして参照する:
+スキルは `~/.agents/skills/ai-ltm/` にインストールされる想定。以下では `SKILL_DIR` 変数にスキルの実パスをセットして参照する:
 
 ```bash
-SKILL_DIR="$(dirname "$(readlink -f ~/.claude/skills/ai-ltm/SKILL.md)")"
+SKILL_DIR="$(cd ~/.agents/skills/ai-ltm && pwd -P)"
 ```
 
 ### 1. データディレクトリの作成
@@ -50,6 +52,7 @@ mkdir -p ~/ai-ltm-data && cd ~/ai-ltm-data
 git init
 sqlite3 ~/ai-ltm-data/memory.db < "$SKILL_DIR/init.sql"
 cp "$SKILL_DIR/.gitignore" ~/ai-ltm-data/.gitignore
+python3 "$SKILL_DIR/scripts/vector_search.py" rebuild --db ~/ai-ltm-data/memory.db
 git remote add origin <your-private-repo-url>
 git add memory.db .gitignore
 git commit -m "init: AI長期記憶システム初期化"
@@ -61,6 +64,27 @@ git push -u origin main
 ```bash
 git clone <remote-url> ~/ai-ltm-data
 ```
+
+## 同期CLI
+
+セッション開始時は、記憶を検索・更新する前に `pull` を実行する:
+
+```bash
+python3 "$SKILL_DIR/scripts/sync_memory.py" pull \
+  --repo ~/ai-ltm-data \
+  --db ~/ai-ltm-data/memory.db
+```
+
+記憶の追加とアーカイブが終わったら `push` を実行する。`--message` は省略できる:
+
+```bash
+python3 "$SKILL_DIR/scripts/sync_memory.py" push \
+  --repo ~/ai-ltm-data \
+  --db ~/ai-ltm-data/memory.db \
+  --message "session: 記憶を更新"
+```
+
+CLIは成功した場合だけ `ltm-sync: pull ok` または `ltm-sync: push ok` を出力する。`push` がcommit対象にするのは指定した `memory.db` だけであり、開始直後にもリモート変更を取り込む。エラーが出た場合は処理を続けず、表示された原因を解消してから再実行する。
 
 ## 使い方
 
@@ -86,6 +110,8 @@ python3 "$SKILL_DIR/scripts/vector_search.py" embed \
 ```
 
 ### 記憶の検索
+
+`search` / `combined` はDBをread-onlyで開く。必要なスキーマ、FTS、cached IDF、設定値が不足または不正な場合は非ゼロで停止する。先に `init.sql` を適用し、既存DBの更新後は明示的に `rebuild` を実行する。
 
 ```bash
 # 複合検索（FTS + ベクトル類似度 + 時間減衰 + 使用頻度ブースト）
@@ -217,21 +243,15 @@ recency_factor = 1 / (1 + days_since_last_used / usage_recency_days)
 - プロジェクト: プロジェクト識別子
 - トピック: 具体的なキーワード（例: `auth`, `performance`, `migration`）
 
-## コンフリクト対処
+## 競合処理と復旧
 
-`git pull` でバイナリコンフリクトが発生した場合は `scripts/merge_conflict.py` を使う:
+`sync_memory.py` は共通祖先・ローカル・リモートの DB を使い、`episodes`、`meta`、`config` を自動で3-way mergeする。Git に SQLite バイナリの内容を選ばせず、双方で追加・変更された記憶を保持し、検索インデックスの整合性を検証した DB へ原子的に置換する。
 
-```bash
-cd ~/ai-ltm-data
-python3 "$SKILL_DIR/scripts/merge_conflict.py" dump --db ~/ai-ltm-data/memory.db --out /tmp/ltm_local.json
-git checkout --theirs memory.db
-git add memory.db
-python3 "$SKILL_DIR/scripts/merge_conflict.py" import --db ~/ai-ltm-data/memory.db --input /tmp/ltm_local.json
-python3 "$SKILL_DIR/scripts/vector_search.py" rebuild --db ~/ai-ltm-data/memory.db
-git add memory.db
-git commit -m "merge: resolve binary conflict, merged episodes"
-git push
-rm -f /tmp/ltm_local.json
-```
+次の場合、同期CLIは既存作業を壊さないよう処理前に停止する:
 
-重複は `summary + created_at` の組み合わせで判定してスキップする。予防としてセッション開始時の `git pull --rebase` を省略しないこと。
+- `memory.db` 以外の変更がワークツリーにある
+- `memory.db` が未ステージ変更以外の状態になっている
+- merge、rebase、cherry-pick が進行中
+- detached HEAD、upstream 未設定、または別の同期処理が実行中
+
+`pull` の fetch、マージ、DB検証、またはマージ統合commitが失敗すると、`memory.db` とGit HEADは処理開始時のスナップショットへ復元され、CLIは非ゼロで終了する。`push` の同期前処理も同じ復元境界を持つが、同期後の専用commitまたはpushが失敗した場合は成功扱いにせず、作成済みのローカルcommitとDBを保持して原因を報告する。手動で片方の DB を選ばず、エラーに示された dirty state や既存Git操作を解消してから `pull` または `push` を再実行する。
