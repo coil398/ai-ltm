@@ -23,10 +23,12 @@ ai-ltm/
 ├── scripts/
 │   ├── vector_search.py        # 検索エンジン（TF-IDF + コサイン類似度）
 │   ├── session_recall.py       # セッション開始時の非同期recall
+│   ├── jev_bridge.py           # 任意のJev候補注記
 │   ├── merge_conflict.py       # SQLite DBの3-way mergeエンジン
 │   └── sync_memory.py          # pull/pushと競合復旧を安全に行う同期CLI
 └── references/
-    └── setup.md                # 初回セットアップガイド
+    ├── setup.md                # 初回セットアップガイド
+    └── session-recall.md       # recall結果と任意注記の仕様
 ```
 
 ## 必要環境
@@ -35,7 +37,7 @@ ai-ltm/
 - SQLite3
 - Git
 
-外部パッケージのインストールは不要です。
+基本機能はPython標準ライブラリとSQLiteだけで動作します。Jev注記は、別途利用できる`jev-hooks`と非空の`TYPESAFE_API_KEY`がある場合だけ任意で実行します。
 
 ## セットアップ
 
@@ -87,6 +89,10 @@ python3 "$SKILL_DIR/scripts/sync_memory.py" push \
 CLIは成功した場合だけ `ltm-sync: pull ok` または `ltm-sync: push ok` を出力する。`push` がcommit対象にするのは指定した `memory.db` だけであり、開始直後にもリモート変更を取り込む。エラーが出た場合は処理を続けず、表示された原因を解消してから再実行する。
 
 ## 使い方
+
+### セッション開始時のrecall
+
+`session_recall.py`は検索結果のID一覧と上位最大5件の候補本文を返します。mainは候補を過去の記録データとして読み、現在の依頼への採否を判断します。キーと検索時間がある場合のJev注記、送信される候補フィールド、失敗時の動作は[Session Recall](references/session-recall.md)を参照してください。
 
 ### 記憶の記録
 
